@@ -6,6 +6,8 @@
 //! It has no flag for a tool server the way other agents do: servers come from the profile's patch
 //! layers. Our tool server therefore arrives as one generated `--patch` overlay for this run, which
 //! the launcher applies after the profile's own layer, so the person's saved profile is untouched.
+//! The overlay is written into a folder of the run's own, owner-only on Unix, so a shared temporary
+//! folder can't be used to reach it.
 //! Its headless profile keeps no session to continue, so a build that stops starts again from the
 //! brief (as it does with the plain adapter).
 
@@ -17,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// own profile by hand, so the two never replace each other.
 const OVERLAY_ID: &str = "mcp-craft-anything-run";
 
+/// DeepSeek Harness run as a coding agent: one task in, its last message out.
 pub struct DeepSeekHarness;
 
 impl AgentAdapter for DeepSeekHarness {
@@ -28,10 +31,8 @@ impl AgentAdapter for DeepSeekHarness {
         let mut v = cx.options.args.clone();
         v.extend(["--profile".into(), "headless".into()]);
         // A question about a build may only read the project's files, so it gets no tool server.
-        if !cx.question
-            && let Some(patch) = tool_server_patch(cx.mcp)
-        {
-            v.extend(["--patch".into(), patch]);
+        if !cx.question {
+            v.extend(["--patch".into(), tool_server_patch(cx.mcp)]);
         }
         v.push(format!("{}{}", cx.preamble, cx.prompt));
         v
@@ -54,35 +55,73 @@ impl AgentAdapter for DeepSeekHarness {
 
     fn check_tool_server(&self, stop: &CancelToken) -> Result<(), ToolError> {
         cli_can_start(craft_anything_platform::self_cli_path().as_deref(), stop)?;
-        overlay_folder().map(|_| ())
+        // The folder and the write a run uses, once, before the build starts: a temporary folder
+        // that can't take the overlay stops the build here with a fix, not part-way through one.
+        let dir = overlay_dir()?;
+        let written = craft_anything_platform::write_atomic_private(&dir.join(PROBE_FILE), b"[]\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        written
     }
 }
 
-/// Where the per-run overlay goes: the system's temporary folder, which the operating system clears
-/// out on its own. One file per run, named for this process, so two builds at once never share one.
-fn overlay_folder() -> Result<std::path::PathBuf, ToolError> {
+/// The overlay's file name inside a run's folder.
+const OVERLAY_FILE: &str = "tool-server.yml";
+
+/// The file a preflight writes and removes to prove the folder takes one.
+const PROBE_FILE: &str = "probe.yml";
+
+/// A folder of this process's own for one run, in the system temporary folder: two builds at once
+/// never share one, and because it's owner-only nothing another user could prepare in a shared
+/// temporary folder is ever written through.
+fn overlay_dir() -> Result<std::path::PathBuf, ToolError> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir();
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("craft-anything-dsh-{}-{n}.yml", std::process::id()));
-    // Prove the folder takes a file before a build starts, rather than building with no tools.
-    std::fs::write(&path, b"[]\n").map_err(|e| {
-        ToolError::new(
-            ErrorCode::FileError,
-            format!("Craft Anything's tools couldn't be prepared for DeepSeek Harness: {} can't be written ({e}).", dir.display()),
-        )
-        .with_remediation(
+    let dir = std::env::temp_dir().join(format!("craft-anything-dsh-{}-{n}", std::process::id()));
+    // `create_dir` refuses a path that is already there, so a folder prepared beforehand is never
+    // used (`create_dir_all` would accept one).
+    private_dir().create(&dir).map_err(|e| {
+        ToolError::io(dir.display(), e).with_remediation(
             "Free space on the drive that holds the temporary folder, or point TMP at one that can be written, then start the build again.".to_string(),
         )
     })?;
-    Ok(path)
+    Ok(dir)
 }
 
-/// Our tool server as a patch overlay for this run, if the file could be written.
-fn tool_server_patch(mcp: &McpCommand) -> Option<String> {
-    let path = overlay_folder().ok()?;
-    std::fs::write(&path, overlay_yaml(mcp)).ok()?;
-    Some(path.display().to_string())
+/// A builder for one run's own folder, owner-only from the moment it exists.
+#[cfg(unix)]
+fn private_dir() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = std::fs::DirBuilder::new();
+    // Made owner-only as it's created, so it's never readable by anyone else, not even briefly.
+    builder.mode(0o700);
+    builder
+}
+
+/// A builder for one run's own folder; Windows keeps each person's temporary folder to themselves.
+#[cfg(not(unix))]
+fn private_dir() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
+/// Our tool server as a patch overlay for this run. A folder that can't take it leaves the harness
+/// a path that isn't there, so the run fails at startup instead of building without the tool server
+/// it was promised; [`check_tool_server`](AgentAdapter::check_tool_server) reports the everyday
+/// causes first, with a fix.
+fn tool_server_patch(mcp: &McpCommand) -> String {
+    let Ok(dir) = overlay_dir() else { return missing_overlay() };
+    let path = dir.join(OVERLAY_FILE);
+    match craft_anything_platform::write_atomic_private(&path, overlay_yaml(mcp).as_bytes()) {
+        Ok(()) => path.display().to_string(),
+        Err(e) => {
+            log::warn!("the DeepSeek Harness tool-server overlay couldn't be written: {}", e.message);
+            missing_overlay()
+        }
+    }
+}
+
+/// A path no run wrote anything to.
+fn missing_overlay() -> String {
+    std::env::temp_dir().join(format!("craft-anything-dsh-{}-missing.yml", std::process::id())).display().to_string()
 }
 
 /// The overlay in the harness's patch format: a list of loader entries, one server inserted.
@@ -108,6 +147,7 @@ fn overlay_yaml(mcp: &McpCommand) -> String {
 mod tests {
     use super::*;
 
+    /// A tool server command for a run's project.
     fn mcp() -> McpCommand {
         McpCommand {
             command: r"C:\Program Files\Craft Anything\craft-anything-cli.exe".into(),
@@ -116,12 +156,14 @@ mod tests {
         }
     }
 
+    /// The arguments for one message, and the server they name.
     fn args(options: &BackendOptions, question: bool) -> (Vec<String>, McpCommand) {
         let mcp = mcp();
         let cx = ArgsCx { options, prompt: "make a game", preamble: "PRE ", mcp: &mcp, resume: None, builder: !question, reads_checked: false, question };
         (DeepSeekHarness.args(&cx), mcp.clone())
     }
 
+    /// The task goes last, after the profile and any extra arguments.
     #[test]
     fn one_task_goes_to_the_headless_profile_last() {
         let (a, _) = args(&BackendOptions::default(), false);
@@ -132,25 +174,51 @@ mod tests {
         assert_eq!(a[0..4], ["--patch", "extra.yml", "--profile", "headless"], "{a:?}");
     }
 
+    /// The run's tool server, as an overlay in a folder of its own that only its owner can read.
     #[test]
-    fn the_tool_server_arrives_as_a_patch_overlay_for_this_run() {
+    fn the_tool_server_arrives_as_a_patch_overlay_in_the_runs_own_folder() {
         let (a, mcp) = args(&BackendOptions::default(), false);
         let i = a.iter().position(|x| x == "--patch").expect("a --patch overlay");
         let path = std::path::PathBuf::from(&a[i + 1]);
         assert!(path.exists(), "{path:?}");
         let written = std::fs::read_to_string(&path).expect("read the overlay");
-        let _ = std::fs::remove_file(&path);
         assert!(written.contains("- insert:"), "{written}");
         assert!(written.contains(OVERLAY_ID), "{written}");
         assert!(written.contains("serverName: craft-anything"), "{written}");
         // The server's own arguments, including the run's project, quoted for YAML.
         assert!(written.contains("- 'mcp'"), "{written}");
         assert!(written.contains(&format!("- '{}'", mcp.args[2])), "{written}");
-        // Two runs never share a file.
+        // A folder of the run's own, so nothing another user prepared in a shared temporary folder
+        // is written through.
+        let folder = path.parent().expect("a folder of its own").to_path_buf();
+        let own = format!("craft-anything-dsh-{}-", std::process::id());
+        assert!(folder.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&own)), "{folder:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let bits = |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(bits(&folder), 0o700, "folder {:o}", bits(&folder));
+            assert_eq!(bits(&path), 0o600, "overlay {:o}", bits(&path));
+        }
+        // Two runs never share one.
         let (b, _) = args(&BackendOptions::default(), false);
-        assert_ne!(a[i + 1], b[b.iter().position(|x| x == "--patch").expect("--patch") + 1]);
+        let other = std::path::PathBuf::from(&b[b.iter().position(|x| x == "--patch").expect("--patch") + 1]);
+        let other_dir = other.parent().expect("a folder of its own").to_path_buf();
+        assert_ne!(folder, other_dir);
+        for dir in [folder, other_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
+    /// A folder that can't take the overlay stops the run, rather than building without the tool
+    /// server it was promised.
+    #[test]
+    fn a_folder_that_cannot_take_the_overlay_leaves_a_path_that_is_not_there() {
+        let missing = missing_overlay();
+        assert!(!std::path::Path::new(&missing).exists(), "{missing}");
+    }
+
+    /// A question may only read, so it gets no tool server.
     #[test]
     fn a_question_gets_no_tool_server() {
         let (a, _) = args(&BackendOptions::default(), true);
@@ -158,6 +226,7 @@ mod tests {
         assert_eq!(a.last().map(String::as_str), Some("PRE make a game"), "{a:?}");
     }
 
+    /// The agent is registered under both ids, not handed to the plain adapter.
     #[test]
     fn registered_not_the_plain_adapter() {
         assert!(AgentAdapters::built_in().for_agent("dsh").ids().contains(&"dsh"));
